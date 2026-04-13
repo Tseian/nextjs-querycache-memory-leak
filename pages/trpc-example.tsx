@@ -9,7 +9,8 @@ import { appRouter } from '@/server/api/root'
 import { createTRPCContext } from '@/server/trpc/context'
 
 const prefetchInput = { name: 'prefetched' }
-const LONG_CACHE_TIME = 1000 * 60 * 60 * 6
+// const LONG_CACHE_TIME = 1000 * 60
+const LONG_CACHE_TIME = Infinity
 const SEED_QUERY_COUNT = 300
 
 export const getServerSideProps: GetServerSideProps = async () => {

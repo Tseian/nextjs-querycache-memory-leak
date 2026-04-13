@@ -14,12 +14,15 @@ const outputDir = process.env.HEAP_SNAPSHOT_DIR
 
 fs.mkdirSync(outputDir, { recursive: true })
 
+let snapshotIndex = 0
+
 function writeSnapshot(tag) {
+  snapshotIndex += 1
   const ts = new Date().toISOString().replace(/[:.]/g, '-')
-  const filename = `heap-${ts}-pid${process.pid}${tag ? `-${tag}` : ''}.heapsnapshot`
+  const filename = `heap-${ts}-idx${String(snapshotIndex).padStart(4, '0')}-pid${process.pid}${tag ? `-${tag}` : ''}.heapsnapshot`
   const filePath = path.join(outputDir, filename)
   const written = v8.writeHeapSnapshot(filePath)
-  process.stdout.write(`[heap-snapshot] wrote ${written}\n`)
+  process.stdout.write(`[heap-snapshot] wrote #${snapshotIndex} ${written}\n`)
 }
 
 setTimeout(() => writeSnapshot('startup'), 0)

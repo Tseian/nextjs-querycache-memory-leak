@@ -3,7 +3,6 @@ import { z } from 'zod'
 import { publicProcedure, router } from '@/server/trpc/trpc'
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
-
 export const exampleRouter = router({
   hello: publicProcedure
     .input(

@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
-    "dev": "HEAP_SNAPSHOT_INTERVAL_MS=20000 NODE_OPTIONS='--require ./scripts/heap-snapshot.cjs' next dev",
+    "dev": "HEAP_SNAPSHOT_INTERVAL_MS=10000 next dev",
     "build": "next build",
     "start": "next start"
   },
