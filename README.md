@@ -1,80 +1,233 @@
-# nextjs-querycache-leak
+# Next.js + tRPC + React Query 服务端 QueryCache 内存泄漏分析
 
-本仓库用于复现并解释一个 Next.js + tRPC + TanStack Query 的内存现象：
-同一页面每次 SSR 都会 prefetch 一批相似数据；当 `QueryCache` 中存在 `cacheTime` 较长的 inactive query 时，prefetch 数据无法及时释放，堆内存会在一段时间内持续抬高。
+## 问题概述
 
-## 当前代码（严格对应）
+在 Next.js Pages Router + tRPC (`ssr: false`) + React Query v4 的架构下，当组件中 `useQuery` 显式传入有限的 `cacheTime`（如 60 秒）时，每个 SSR 请求创建的 `QueryCache` 会被一个 `setTimeout` 钉在服务端内存中，直到 `cacheTime` 到期才能被 V8 GC 回收。
 
-1. `pages/index.tsx` 的 `getServerSideProps` 中，每次请求都会：
-- 创建新的 `createServerSideHelpers(...)`
-- 并发 prefetch 300 次 `example.hello`（`name=prefetched-${i}`）
-- 执行 `helpers.dehydrate()`
-- 执行 `helpers.queryClient.clear()`
+在高并发场景下，大量请求的 QueryCache 同时滞留，表现为服务端内存持续上涨。
 
-2. 同一页面客户端会挂载一个 `SeedQuery`（`example.hello1.useQuery`）：
-- `enabled: false`
-- `cacheTime: LONG_CACHE_TIME`
-- 1.2 秒后组件卸载，使其进入 inactive
+### 现象
 
-3. 堆快照通过 `server/api/root.ts` 顶层 `require("../../scripts/heap-snapshot.cjs")` 启用：
-- 启动后立即抓一次
-- 然后按 `HEAP_SNAPSHOT_INTERVAL_MS` 周期抓取
+| `cacheTime` | QueryCache 被 GC 回收时间 | 高并发表现 |
+|---|---|---|
+| `Infinity` | **< 1 秒**（几乎立即） | 内存平稳 |
+| `60s` | **精确 60 秒后** | 内存持续累积，60 秒后才开始回落 |
 
-## 核心结论
+---
 
-- `LONG_CACHE_TIME = Infinity` 时，`QueryClient/QueryCache` 更快变为不可达，prefetch 相关对象更快回收。
-- `LONG_CACHE_TIME = 60s` 时，通常要等约 60 秒窗口结束后，`QueryClient/QueryCache` 及其挂载的数据才明显下降。
+## 根因分析
 
-## 核心原因（本仓库要点）
+### 1. `ssr: false` 不等于"服务端不执行 React 组件"
 
-- prefetch 到的数据在注入 `QueryCache` 后，在堆中表现为依附于该 `QueryCache` 的生命周期（可在快照中观察到：`QueryCache` 未释放前，这批数据通常不会整体消失）。
-- 只要 `QueryCache` 因为长 `cacheTime` 的 inactive query 仍被定时器链路保持可达，这批 prefetch 数据就不会及时释放。
-- 同一页面每次 SSR 都会重复创建一份新的 helpers/query cache，并重复 prefetch 300 份相似数据。
-- 在高请求量下，这些“上一批尚未释放 + 新一批持续进入”会叠加，表现为线上缓存体积快速膨胀。
+`createTRPCNext` 的 `ssr: false` 仅控制是否注入 `getInitialProps` 做 tRPC 自动数据预取（prepass 循环）。**Next.js 仍然会 SSR 渲染整棵 React 组件树**来生成初始 HTML。
 
-> 这更接近“延迟回收导致的堆积”，而非永久不可回收的经典泄漏。
+```tsx
+// withTRPC.tsx:139 — ssr: false 时这个 if 不进入
+if (AppOrPage.getInitialProps ?? opts.ssr) {
+  WithTRPC.getInitialProps = async () => { /* prepass 循环 */ }
+}
 
-## 复现步骤
-
-1. 安装依赖
-
-```bash
-pnpm install
+// 但 WithTRPC 组件体（:92-136）每次 SSR 都执行：
+const WithTRPC = (props) => {
+  const [prepassProps] = useState(() => {
+    const config = getClientConfig({});      // ← 每次请求都调用 config()
+    const queryClient = getQueryClient(config); // ← 每次创建新 QueryClient
+    ...
+  });
+  return (
+    <QueryClientProvider client={queryClient}>
+      <Hydrate state={hydratedState}>         {/* useMemo → 服务端同步执行 */}
+        <AppOrPage {...props} />
+      </Hydrate>
+    </QueryClientProvider>
+  );
+};
 ```
 
-2. 在 `pages/index.tsx` 切换：
-- 快速回收场景：`const LONG_CACHE_TIME = Infinity`
-- 延迟回收场景：`const LONG_CACHE_TIME = 1000 * 60`
+### 2. 同一份数据在服务端存在三份拷贝
 
-3. 启动
-
-```bash
-pnpm dev
+```
+tRPC procedure 返回数据
+       │
+       ▼
+  QueryClient-A（createServerSideHelpers 专用）
+  ├─ 300 个 query.state.data
+  └─ helpers.dehydrate() → JSON 序列化 → helpers.queryClient.clear() ✅ 已清理
+       │
+       ▼
+  trpcState（序列化的 JSON，随 props 传输）
+       │
+       ├─────────────────────────┐
+       ▼                         ▼
+  服务端 SSR 渲染              客户端 hydrate
+  <Hydrate useMemo>            <Hydrate useMemo>
+       │                         │
+       ▼                         ▼
+  QueryCache-B（服务端）       QueryCache-C（客户端）
+  301 个 Query 带 data         301 个 Query 带 data
+  ⚠️ 被 setTimeout 钉住       ✅ 正常使用
 ```
 
-4. 访问页面并连续刷新
+**QueryCache-B 就是泄漏源头**——它的使命在 `renderToString` 结束后就完成了，本应立即被 V8 GC 回收。
 
-```text
-http://localhost:3000/
+### 3. `setTimeout` 引用链阻止 GC
+
+`<Hydrate>` 使用 `useMemo`（不是 `useEffect`）在服务端同步注入 300 个查询。当组件的 `useQuery` 传入有限 `cacheTime` 时，`Query` 构造函数中的 `scheduleGc()` 创建 `setTimeout`：
+
+```
+// @tanstack/query-core — removable.ts
+protected scheduleGc(): void {
+  if (isValidTimeout(this.cacheTime)) {         // Infinity → false → 不创建定时器
+    this.gcTimeout = setTimeout(() => {          // 60000 → true → 创建定时器
+      this.optionalRemove()
+    }, this.cacheTime)
+  }
+}
+
+// utils.ts
+function isValidTimeout(value) {
+  return typeof value === 'number' && value >= 0 && value !== Infinity
+}
 ```
 
-5. 观察 `snapshots/` 与堆趋势
-- `Infinity`：回落更快
-- `60s`：存在明显滞留窗口，约 60 秒后才回落
+这个 `setTimeout` 形成的引用链：
 
-## 线上意义
+```
+Node.js 定时器列表（GC Root）
+  └─ setTimeout 回调闭包
+       └─ this（= hello1 Query 对象）
+            └─ this.cache（= QueryCache-B）
+                 └─ this.queriesMap
+                      ├─ Query: hello/prefetched-0   → state.data: {...}
+                      ├─ Query: hello/prefetched-1   → state.data: {...}
+                      ├─ ...（共 300 个 hydrate 注入的查询）
+                      └─ Query: hello1/seed          → （触发 setTimeout 的查询）
+```
 
-- 当服务端按请求创建 `QueryClient`，且存在较长 `cacheTime` 的 inactive query 时，prefetch 数据会随 `QueryCache` 生命周期一起滞留。
-- 如果 QPS 较高，这种滞留会跨请求叠加，形成“缓存暴涨”的线上体感。
+**一个 Query 的定时器 → 拖住整个 QueryCache → 拖住所有 301 个 Query 及其数据。**
 
-## 优化建议
+### 4. React Query 的服务端保护被显式 `cacheTime` 绕过
 
-建议按执行环境设置 `cacheTime`：server 端使用 `Infinity`，client 端使用业务可接受的有限值。
+React Query 在 `updateCacheTime` 中特意为服务端设了 `Infinity` 默认值来防止这个问题：
 
-```ts
-const cacheTime = typeof window === 'undefined' ? Infinity : TRPC_CACHE_TIME
-trpc.xx.xx.useQuery(input, {
-  cacheTime,
+```typescript
+// removable.ts
+protected updateCacheTime(newCacheTime: number | undefined): void {
+  this.cacheTime = Math.max(
+    this.cacheTime || 0,
+    newCacheTime ?? (isServer ? Infinity : 5 * 60 * 1000),
+    //               ^^^^^^^^ 服务端默认 Infinity，不会产生定时器
+  )
+}
+```
+
+但当组件 **显式传入** `cacheTime: 60000` 时，`newCacheTime` 不是 `undefined`，`??` 右侧不会触发，保护机制被绕过。
+
+---
+
+## 解决方案
+
+### 推荐方案：ServerSafeQueryCache
+
+子类化 `QueryCache`，在服务端的 `build()` 方法中强制 `cacheTime: Infinity`：
+
+```typescript
+// lib/trpc.ts
+const isServer = typeof window === 'undefined'
+
+class ServerSafeQueryCache extends QueryCache {
+  build(client: any, options: any, state?: any) {
+    return super.build(client, { ...options, cacheTime: Infinity }, state)
+  }
+}
+
+export const trpc = createTRPCNext<AppRouter>({
+  config(opts) {
+    const queryClientConfig = { /* ... */ }
+
+    if (isServer) {
+      queryClientConfig.queryCache = new ServerSafeQueryCache()
+    } else {
+      queryClientConfig.queryCache = new QueryCache()
+    }
+
+    return { queryClientConfig, links: [/* ... */] }
+  },
   ssr: false,
 })
 ```
+
+**为什么这是最优解：**
+
+| 特性 | 说明 |
+|---|---|
+| 全局兜底 | 不管组件传什么 `cacheTime`，服务端一律 `Infinity`，从源头阻止 `setTimeout` |
+| 不影响客户端 | `isServer` 判断确保客户端行为完全不变 |
+| 不改业务代码 | 组件里的 `useQuery` 参数不用动 |
+| 原理正确 | 利用 React Query 自身的 `isValidTimeout(Infinity) === false` 机制 |
+
+### 其他可选方案
+
+| 方案 | 做法 | 优点 | 局限 |
+|---|---|---|---|
+| 组件级防护 | `cacheTime: typeof window === 'undefined' ? Infinity : 60000` | 最小改动 | 每个 `useQuery` 都要加，易遗漏 |
+| `next/dynamic ssr:false` | 用 `dynamic(() => ..., { ssr: false })` 包裹组件 | 彻底不在服务端执行 | 该组件 SSR 不产出 HTML |
+| `defaultOptions` 设默认值 | `defaultOptions.queries.cacheTime = Infinity`（仅服务端） | 全局默认 | 无法拦截组件显式传入的 `cacheTime` |
+
+---
+
+## 验证方法
+
+### 脚本验证
+
+使用 `FinalizationRegistry` 追踪 `QueryCache` 对象的 GC 回收时机：
+
+```bash
+node --expose-gc scripts/verify-fix.cjs
+```
+
+预期输出：
+
+```
+❌ 原始 QueryCache（组件传 cacheTime: 60000）
+  原始-QueryCache: 301 个查询, 实际 cacheTime=60000
+
+✅ ServerSafeQueryCache（强制 cacheTime: Infinity）
+  修复-ServerSafeQueryCache: 301 个查询, 实际 cacheTime=Infinity
+
+--- 观察 GC ---
+
+  [1.0s] ✅ 修复-ServerSafeQueryCache 已被 GC 回收
+  （原始-QueryCache 需等待 60s 后才会被回收）
+```
+
+### Heap Snapshot 验证
+
+```bash
+HEAP_SNAPSHOT_INTERVAL_MS=10000 pnpm dev
+```
+
+访问页面多次后，对比 `snapshots/` 目录中的堆快照：
+- 修复前：QueryCache 及其 301 个 Query 在快照中持续存在
+- 修复后：QueryCache 在下一次快照前已被回收
+
+---
+
+## 涉及的关键源码
+
+| 文件 | 关键逻辑 |
+|---|---|
+| `@trpc/next/src/withTRPC.tsx:92-136` | `WithTRPC` 组件体，每次 SSR 创建新 QueryClient |
+| `@trpc/next/src/withTRPC.tsx:139` | `ssr: false` 仅控制是否注入 `getInitialProps` |
+| `@tanstack/react-query/src/Hydrate.tsx:22` | `useMemo` 在服务端同步执行 `hydrate()` |
+| `@tanstack/query-core/src/removable.ts:11-19` | `scheduleGc()` — 创建 GC 定时器 |
+| `@tanstack/query-core/src/removable.ts:21-27` | `updateCacheTime()` — 服务端默认 `Infinity` |
+| `@tanstack/query-core/src/utils.ts:86-88` | `isValidTimeout()` — `Infinity` 返回 `false` |
+| `@tanstack/query-core/src/query.ts:176` | `Query` 构造函数调用 `scheduleGc()` |
+| `@tanstack/query-core/src/hydration.ts:157` | `hydrate()` 调用 `queryCache.build()` 注入查询 |
+
+## 适用版本
+
+- `@tanstack/react-query` ^4.x（使用 `cacheTime`；v5 中已重命名为 `gcTime`，机制相同）
+- `@trpc/next` ^10.x（Pages Router + `withTRPC` HOC）
+- `next` ^13.x / ^14.x / ^15.x（Pages Router with `getServerSideProps`）
