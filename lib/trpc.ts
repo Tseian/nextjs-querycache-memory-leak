@@ -3,6 +3,16 @@ import { createTRPCNext } from '@trpc/next'
 const { QueryCache } = require('@tanstack/react-query') as typeof import('@tanstack/react-query')
 import type { AppRouter } from '@/server/api/root'
 
+const isServer = typeof window === 'undefined'
+
+// 服务端子类：强制所有 Query 的 cacheTime 为 Infinity，
+// 阻止 scheduleGc() 创建 setTimeout，避免 GC 定时器钉住整个 QueryCache。
+class ServerSafeQueryCache extends QueryCache {
+  build(client: any, options: any, state?: any) {
+    return super.build(client, { ...options, cacheTime: Infinity }, state)
+  }
+}
+
 function getBaseUrl() {
   if (typeof window !== 'undefined') return ''
   if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`
@@ -14,18 +24,21 @@ export const trpc = createTRPCNext<AppRouter>({
     const queryClientConfig: any = {
       defaultOptions: {
         queries: {
-          // staleTime: 60_000,
-          // cacheTime: 60_000,
           refetchOnMount: false,
           refetchOnReconnect: false,
           refetchOnWindowFocus: false,
         },
       },
     }
-// 给 queryCache 打上 debug_id ，方便调试
-    const queryCache = new QueryCache();
-    (queryCache as any)["debug_id"] = `trpc-query-cache-${index++}`
-    queryClientConfig.queryCache = queryCache
+
+    if (isServer) {
+      queryClientConfig.queryCache = new ServerSafeQueryCache()
+    } else {
+      // 客户端：给 queryCache 打上 debug_id，方便调试
+      const queryCache = new QueryCache()
+      ;(queryCache as any)['debug_id'] = `trpc-query-cache-${index++}`
+      queryClientConfig.queryCache = queryCache
+    }
 
     return {
       queryClientConfig,
