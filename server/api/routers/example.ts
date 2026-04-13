@@ -18,4 +18,18 @@ export const exampleRouter = router({
         serverTimeISO: new Date().toISOString(),
       }
     }),
+  hello1: publicProcedure
+    .input(
+      z.object({
+        name: z.string().optional(),
+      }),
+    )
+    .query(async ({ input }) => {
+      await sleep(200)
+      const name = input.name?.trim() || 'world'
+      return {
+        greeting: `Hello, ${name}!`,
+        serverTimeISO: new Date().toISOString(),
+      }
+    }),
 })

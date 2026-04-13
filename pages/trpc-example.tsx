@@ -8,10 +8,9 @@ import { trpc } from '@/lib/trpc'
 import { appRouter } from '@/server/api/root'
 import { createTRPCContext } from '@/server/trpc/context'
 
-const prefetchInput = { name: 'prefetched' }
-// const LONG_CACHE_TIME = 1000 * 60
-const LONG_CACHE_TIME = Infinity
-const SEED_QUERY_COUNT = 300
+const LONG_CACHE_TIME = 1000 * 60
+// const LONG_CACHE_TIME = Infinity
+const SSR_PREFETCH_COUNT = 300
 
 export const getServerSideProps: GetServerSideProps = async () => {
   const ctx = await createTRPCContext({ req: new Request('http://localhost') })
@@ -20,7 +19,11 @@ export const getServerSideProps: GetServerSideProps = async () => {
     ctx,
   })
 
-  await helpers.example.hello.prefetch(prefetchInput)
+  await Promise.all(
+    Array.from({ length: SSR_PREFETCH_COUNT }, (_, i) =>
+      helpers.example.hello.prefetch({ name: `prefetched-${i}` }),
+    ),
+  )
   const trpcState = helpers.dehydrate()
   helpers.queryClient.clear()
 
@@ -32,7 +35,7 @@ export const getServerSideProps: GetServerSideProps = async () => {
 }
 
 function SeedQuery({ name }: { name: string }) {
-  trpc.example.hello.useQuery(
+  trpc.example.hello1.useQuery(
     { name },
     {
       enabled: false,
@@ -62,16 +65,14 @@ const TrpcExamplePage: NextPage = () => {
     <main className="px-4 py-10">
       {seedMounted ? (
         <div className="hidden">
-          {Array.from({ length: SEED_QUERY_COUNT }, (_, i) => (
-            <SeedQuery key={`${batchId}-${i}`} name={`${batchId}-${i}`} />
-          ))}
+          <SeedQuery key={batchId} name={batchId} />
         </div>
       ) : null}
 
       <div className="mx-auto max-w-2xl rounded-xl border border-neutral-200 bg-white/70 p-4 space-y-2">
         <h1 className="text-2xl font-semibold tracking-tight">Minimal Repro</h1>
         <p className="text-sm text-neutral-700">
-          Mount 300 disabled queries with cacheTime=6h, then unmount after 1.2s.
+          Prefetch 300 queries in getServerSideProps, mount 1 disabled query on client, then unmount after 1.2s.
         </p>
         <div className="text-sm">seed mounted: {seedMounted ? 'yes' : 'no'}</div>
         <div className="text-sm">seed query count in cache: {seededCount}</div>
