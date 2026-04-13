@@ -56,8 +56,11 @@ HEAP_SNAPSHOT_INTERVAL_MS=10000 NODE_OPTIONS="--require ./scripts/heap-snapshot.
 核心不是“有没有 clear”，而是“是否还有活跃引用链”。
 
 - `helpers.queryClient.clear()` 只是在逻辑上清空缓存内容，不等于立刻让整棵对象图可回收。
-- 当 `cacheTime = 60s` 时，query 生命周期会关联定时器窗口；这些定时器/回调链会让 query 及其关联结构在窗口期内继续可达。
+- 当 `cacheTime = 60s` 时，query 生命周期进入 inactive 状态后会关联定时器窗口；这些定时器/回调链会让 query 及其关联结构在窗口期内继续可达，其他 prefetch 的 query 也会保持可达。
 - 当 `cacheTime = Infinity` 时，不会建立这类短期 GC 定时回收链路（没有 60s 的 timer 窗口），对象在请求结束后更容易整体变成不可达，从而更快被 V8 回收。
+
+[refer](refer.jpg)
+
 
 ## 对 Next.js 线上现象的解释
 
@@ -72,7 +75,5 @@ HEAP_SNAPSHOT_INTERVAL_MS=10000 NODE_OPTIONS="--require ./scripts/heap-snapshot.
 
 ## 实践建议
 
-- SSR 场景尽量复用或严格控制请求级 `QueryClient` 创建策略。
-- 避免在高并发线上将 `cacheTime` 设成较大的有限值，先压测观察回收曲线。
-- 用 heap snapshot 按 `pid` 和时间窗口对比，不要只看某一个瞬时点。
+- 在 server 端设置 cacheTime 为 `Infinity` 以快速回收。
 - 排查时优先确认：对象是“最终会回收但滞后”，还是“始终可达的真正泄漏”。
